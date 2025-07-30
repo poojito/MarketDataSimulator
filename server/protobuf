@@ -1,0 +1,207 @@
+message UnsubscribeRequest {
+  repeated int32 Ids = 2;
+}
+
+message Subscription {
+  SubscribeRequest Subscribe = 1;
+  UnsubscribeRequest Unsubscribe = 2;
+}
+
+message OrderbookLevel {
+  int32 Price = 1;
+  bool IsBuy = 2;
+  uint32 Quantity = 3;
+}
+
+enum OrderbookLevelUpdateType {
+  Invalid = 0;
+  Add = 1;
+  Replace = 2;
+  Remove = 3;
+}
+
+message OrderbookLevelUpdate {
+  OrderbookLevelUpdateType UpdateType = 1;
+  OrderbookLevel Level = 2;
+}
+
+message OrderbookSnapshotUpdate {
+  repeated OrderbookLevelUpdate Bids = 1;
+  repeated OrderbookLevelUpdate Asks = 2;
+}
+
+message OrderbookIncrementalUpdate {
+  OrderbookLevelUpdate Update = 1;
+}
+
+message OrderbookUpdate {
+  int32 InstrumentId = 1;
+  oneof Update {
+    OrderbookSnapshotUpdate Snapshot = 2;
+    OrderbookIncrementalUpdate Incremental = 3;
+  }
+}
+
+service OrderbookService {
+  rpc StreamOrderbookUpdates (stream Subscription) returns (stream OrderbookUpdate);
+}
+
+
+
+
+
+
+
+// client
+
+
+public class Client : Proto.OrderbookService.OrderbookServiceClient, IDisposable
+{
+    public Client(GrpcChannel channel) : base(channel)
+    {
+        _streamingTask = StreamAsync(this, _subscriptionChannel.Reader, _shutdownSource);
+    }
+
+    private static async Task StreamAsync(Client client,
+        ChannelReader<(bool Subscribe, int InstrumentId)> reader,
+        TaskCompletionSource shutdownSource)
+    {
+        using (var streaming = client.StreamOrderbookUpdates())
+        {
+            _ = HandleResponsesAsync(streaming.ResponseStream, shutdownSource);
+
+            while (true)
+            {
+                try
+                {
+                    var readTask = reader.WaitToReadAsync();
+
+                    if (readTask.IsCompleted)
+                    {
+                        _ = readTask.Result;
+                    }
+                    else
+                    {
+                        await Task.WhenAny(shutdownSource.Task, readTask.AsTask()).ConfigureAwait(false);
+                    }
+
+                    if (shutdownSource.Task.IsCompleted)
+                        return;
+
+                    var subscription = await reader.ReadAsync().ConfigureAwait(false);
+
+                    var request = new Subscription();
+
+                    if (subscription.Subscribe)
+                    {
+                        request.Subscribe = new SubscribeRequest();
+                        request.Subscribe.Ids.Add(subscription.InstrumentId);
+                    }
+                    else
+                    {
+                        request.Unsubscribe = new UnsubscribeRequest();
+                        request.Unsubscribe.Ids.Add(subscription.InstrumentId);
+                    }
+
+                    await streaming.RequestStream.WriteAsync(request).ConfigureAwait(false);
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine($"Error in {nameof(StreamAsync)}: {e}");
+                }
+            }
+        }
+    }
+}
+
+
+private OrderbookSnapshotUpdate Refresh(Random random, Instrument instrument)
+{
+    lock (_disposedLock)
+    {
+        if (_disposed)
+            return OrderbookSnapshotUpdate.Empty;
+
+        _bids.Clear();
+        _bidLevels.Clear();
+        _asks.Clear();
+        _askLevels.Clear();
+
+        if (random.NextDouble() > 0.99)
+            return OrderbookSnapshotUpdate.Empty;
+
+        foreach (var i in Enumerable.Range(0, instrument.Specifications.Depth))
+            _ = Update(random, instrument);
+
+        return new OrderbookSnapshotUpdate(_instrument.Id, _bidLevels.AsReadOnly(), _askLevels.AsReadOnly());
+    }
+}
+
+public async Task SendAsync(OrderbookUpdate update, CancellationToken token)
+{
+    using (await _subscriptionsLock.LockAsync().ConfigureAwait(false))
+    {
+        if (!_subscriptions.TryGetValue(update.InstrumentId, out var snapshot) && !update.IsEmptySnapshot)
+            return;
+
+        if (snapshot && !update.IsSnapshot)
+            return;
+
+        if (snapshot && update.IsSnapshot)
+            _subscriptions[update.InstrumentId] = false;
+
+        Proto.OrderbookUpdate response = new Proto.OrderbookUpdate()
+        {
+            InstrumentId = update.InstrumentId,
+        };
+
+        if (update.IsSnapshot)
+        {
+            response.Snapshot = new Proto.OrderbookSnapshotUpdate();
+            response.Snapshot.Asks.AddRange(update.Snapshot.Asks.Select(ProtoAdapter.ToSnapshotLevel));
+            response.Snapshot.Bids.AddRange(update.Snapshot.Bids.Select(ProtoAdapter.ToSnapshotLevel));
+        }
+        else
+        {
+            response.Incremental = new Proto.OrderbookIncrementalUpdate();
+            response.Incremental.Update = ProtoAdapter.ToIncrementalLevel(update.Incremental);
+        }
+
+        await _stream.WriteAsync(response, token).ConfigureAwait(false);
+    }
+}
+
+
+private static async Task HandleResponsesAsync(IAsyncStreamReader<Proto.OrderbookUpdate> responseStream, TaskCompletionSource shutdownSource)
+{
+    while (await responseStream.MoveNext().ConfigureAwait(false))
+    {
+        await foreach (var response in responseStream.ReadAllAsync().ConfigureAwait(false))
+        {
+            var update = ProtoAdapter.FromProto(response);
+
+            if (update.IsSnapshot)
+            {
+                Console.WriteLine($"[{DateTime.Now:0}] Received (empty: {update.IsEmptySnapshot}) snapshot for {update.InstrumentId}");
+
+                if (update.Snapshot.Asks.Any())
+                {
+                    Console.WriteLine("---- Asks ----");
+                    Console.WriteLine(string.Join('\n', update.Snapshot.Asks));
+                }
+
+                if (update.Snapshot.Bids.Any())
+                {
+                    Console.WriteLine("---- Bids ----");
+                    Console.WriteLine(string.Join('\n', update.Snapshot.Bids));
+                }
+            }
+            else
+            {
+                Console.WriteLine($"[{DateTime.Now:0}] Received incremental for {update.InstrumentId}");
+                Console.WriteLine($"\t{update.Incremental.Type} = {update.Incremental.Level}");
+            }
+        }
+    }
+}
+
